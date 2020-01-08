@@ -334,7 +334,7 @@ impl<TyIx, Ty: fmt::Debug> fmt::Debug for TypedIxVec<TyIx, Ty> {
 // Definitions of register classes, registers and stack slots, and printing
 // thereof.
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum RegClass {
   I32,
   F32,
@@ -349,7 +349,7 @@ impl fmt::Debug for RegClass {
   }
 }
 
-const NUM_REG_CLASSES: usize = 2;
+pub const NUM_REG_CLASSES: usize = 2;
 
 impl RegClass {
   fn rc_to_u32(self) -> u32 {
@@ -467,7 +467,7 @@ pub fn mkVirtualReg(rc: RegClass, index: u32) -> Reg {
 // dynamically ensure that they are really wrapping the correct flavour of
 // register.
 
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq)]
 pub struct RealReg {
   reg: Reg,
 }
@@ -1940,6 +1940,10 @@ impl SortedRangeFragIxs {
     res.fragIxs.push(fix);
     res.check(fenv);
     res
+  }
+
+  pub fn len(&self) -> usize {
+    self.fragIxs.len()
   }
 }
 
