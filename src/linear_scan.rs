@@ -23,6 +23,9 @@ use crate::data_structures::{
 type Fragments = TypedIxVec<RangeFragIx, RangeFrag>;
 type VirtualRanges = TypedIxVec<VirtualRangeIx, VirtualRange>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LiveId(usize);
+
 enum LiveIntervalKind<'a> {
   Fixed(&'a mut RealRange),
   Virtual(&'a mut VirtualRange),
@@ -38,6 +41,7 @@ impl<'a> fmt::Debug for LiveIntervalKind<'a> {
 }
 
 struct LiveInterval<'a> {
+  id: LiveId,
   kind: LiveIntervalKind<'a>,
   cur_frag_index: usize,
 }
@@ -48,19 +52,14 @@ impl<'a> fmt::Debug for LiveInterval<'a> {
   }
 }
 
-impl<'a> Into<LiveInterval<'a>> for &'a mut RealRange {
-  fn into(self) -> LiveInterval<'a> {
-    LiveInterval { kind: LiveIntervalKind::Fixed(self), cur_frag_index: 0 }
-  }
-}
-
-impl<'a> Into<LiveInterval<'a>> for &'a mut VirtualRange {
-  fn into(self) -> LiveInterval<'a> {
-    LiveInterval { kind: LiveIntervalKind::Virtual(self), cur_frag_index: 0 }
-  }
-}
-
 impl<'a> LiveInterval<'a> {
+  fn from_real(id: LiveId, range: &'a mut RealRange) -> Self {
+    Self { id, kind: LiveIntervalKind::Fixed(range), cur_frag_index: 0 }
+  }
+  fn from_virtual(id: LiveId, range: &'a mut VirtualRange) -> Self {
+    Self { id, kind: LiveIntervalKind::Virtual(range), cur_frag_index: 0 }
+  }
+
   fn reg_class(&self) -> RegClass {
     match &self.kind {
       LiveIntervalKind::Fixed(r) => r.rreg.get_class(),
@@ -145,15 +144,30 @@ fn update_state<'a>(
   //  - and they have other fragments: they become inactive.
   //  - and they don't: they become handled.
   // - or they're still active.
-  for active_int in state.active.into_iter() {
+  for &active_int_id in &state.active {
+    let active_int = &mut state.intervals[active_int_id];
     if active_int.cur_frag_covers(start_point, &fragments) {
       // Remains active.
-      next_active.push(active_int);
+      next_active.push(active_int_id);
     } else {
       if active_int.has_more_frags() {
         active_int.move_to_next_frag();
+
         // XXX do we need to free on active->inactive?
-        next_inactive.push(active_int);
+        next_inactive.push(active_int_id);
+
+        // XXX is this needed? bnjbvr continue here
+        // Remove from unhandled, and add it back to the next fragment's start
+        // position.
+        let index =
+          state.unhandled.iter().position(|&id| id == active_int_id).unwrap();
+        let id = state.unhandled.remove(index);
+        insert_unhandled(
+          &mut state.unhandled,
+          &state.intervals,
+          &state.intervals[id],
+          fragments,
+        );
       } else {
         // Free the register, if it was allocated one.
         if let Some(reg) = active_int.allocated_register() {
@@ -168,11 +182,13 @@ fn update_state<'a>(
   // Update inactive intervals:
   // - either their start point is after the current position, so they remain inactive.
   // - or they remain inactive.
-  for inactive_int in state.inactive.into_iter() {
+  for &inactive_int_id in &state.inactive {
+    let inactive_int = &mut state.intervals[inactive_int_id];
+    debug_assert!(inactive_int.has_more_frags());
     if inactive_int.cur_frag_covers(start_point, &fragments) {
-      next_active.push(inactive_int);
+      next_active.push(inactive_int_id);
     } else {
-      next_inactive.push(inactive_int);
+      next_inactive.push(inactive_int_id);
     }
   }
 
@@ -253,25 +269,70 @@ impl Registers {
   }
 }
 
+struct Intervals<'a> {
+  data: Vec<LiveInterval<'a>>,
+}
+
+impl<'a> Intervals<'a> {
+  fn new(capacity: usize) -> Self {
+    Self { data: Vec::with_capacity(capacity) }
+  }
+  fn push_real(&mut self, range: &'a mut RealRange) {
+    let id = LiveId(self.data.len());
+    self.data.push(LiveInterval::from_real(id, range))
+  }
+  fn push_virtual(&mut self, range: &'a mut VirtualRange) {
+    let id = LiveId(self.data.len());
+    self.data.push(LiveInterval::from_virtual(id, range))
+  }
+}
+
+impl<'a> std::ops::Index<LiveId> for Intervals<'a> {
+  type Output = LiveInterval<'a>;
+  fn index(&self, id: LiveId) -> &Self::Output {
+    &self.data[id.0]
+  }
+}
+
+impl<'a> std::ops::IndexMut<LiveId> for Intervals<'a> {
+  fn index_mut(&mut self, id: LiveId) -> &mut Self::Output {
+    &mut self.data[id.0]
+  }
+}
+
 /// State structure, which can be cleared between different calls to register allocation.
 struct State<'a> {
+  intervals: Intervals<'a>,
+
   /// A list of active intervals, sorted by increasing end point.
-  active: Vec<&'a mut LiveInterval<'a>>,
+  active: Vec<LiveId>,
 
   /// A list of inactive intervals, sorted by increasing end point too.
-  inactive: Vec<&'a mut LiveInterval<'a>>,
+  inactive: Vec<LiveId>,
+
+  /// Unhandled intervals need to be processed by the main iteration loop,
+  /// either because they have never been processed, or because they are
+  /// inactive with another fragment.
+  unhandled: Vec<LiveId>,
 
   /// Registers picker.
   regs: Vec<Registers>,
 }
 
 impl<'a> State<'a> {
-  fn new(reg_universe: &RealRegUniverse) -> Self {
+  fn new(intervals: Intervals<'a>, reg_universe: &RealRegUniverse) -> Self {
     let mut all_regs = Vec::with_capacity(NUM_REG_CLASSES);
     for cur_reg_class in &[RegClass::I32, RegClass::F32] {
       all_regs.push(Registers::new(*cur_reg_class as usize, reg_universe))
     }
-    Self { active: Vec::new(), inactive: Vec::new(), regs: all_regs }
+    let unhandled = intervals.data.iter().map(|int| int.id).collect();
+    Self {
+      intervals,
+      unhandled,
+      active: Vec::new(),
+      inactive: Vec::new(),
+      regs: all_regs,
+    }
   }
 
   #[allow(dead_code)]
@@ -285,20 +346,41 @@ impl<'a> State<'a> {
     &mut self.regs[reg_class as usize]
   }
 
-  fn insert_active(
-    &mut self, interval: &'a mut LiveInterval<'a>, fragments: &Fragments,
-  ) {
-    // Add this interval to the list of active intervals.
-    let index = self.active.binary_search_by_key(
-      &interval.last_end_point(&fragments),
-      |active_int| active_int.last_end_point(&fragments),
-    );
-    let index = match index {
-      Ok(index) => index,
-      Err(index) => index,
-    };
-    self.active.insert(index, interval);
+  fn next_unhandled(&mut self) -> Option<LiveId> {
+    self.unhandled.first().cloned()
   }
+}
+
+fn insert_unhandled<'a>(
+  unhandled: &mut Vec<LiveId>, intervals: &Intervals,
+  interval: &LiveInterval<'a>, fragments: &Fragments,
+) {
+  // Add this interval to the list of active intervals.
+  let index = unhandled
+    .binary_search_by_key(&interval.start_point(&fragments), |unhandled_int| {
+      intervals[*unhandled_int].start_point(&fragments)
+    });
+  let index = match index {
+    Ok(index) => index,
+    Err(index) => index,
+  };
+  unhandled.insert(index, interval.id);
+}
+
+fn insert_active<'a>(
+  active: &mut Vec<LiveId>, intervals: &Intervals, interval: &LiveInterval<'a>,
+  fragments: &Fragments,
+) {
+  // Add this interval to the list of active intervals.
+  let index = active
+    .binary_search_by_key(&interval.last_end_point(&fragments), |active_int| {
+      intervals[*active_int].last_end_point(&fragments)
+    });
+  let index = match index {
+    Ok(index) => index,
+    Err(index) => index,
+  };
+  active.insert(index, interval.id);
 }
 
 // Allocator top level.  |func| is modified so that, when this function
@@ -311,35 +393,32 @@ pub fn alloc_main(
 ) -> Result<(), String> {
   let (mut rlrs, mut vlrs, fragments) = run_analysis(func)?;
 
-  let all_intervals = {
-    let mut int: Vec<LiveInterval> =
-      Vec::with_capacity(rlrs.len() as usize + vlrs.len() as usize);
-    // TODO we could avoid the clone with into_iter on TVec.
+  let intervals = {
+    let mut int = Intervals::new(rlrs.len() as usize + vlrs.len() as usize);
     for rlr in rlrs.iter_mut() {
-      int.push(rlr.into());
+      int.push_real(rlr);
     }
     for vlr in vlrs.iter_mut() {
-      int.push(vlr.into())
+      int.push_virtual(vlr)
     }
 
     // Sort by increasing start point of their first fragment, since their other fragments are
     // already sorted.
-    int.sort_by_key(|live_int| live_int.start_point(&fragments));
+    int.data.sort_by_key(|live_int| live_int.start_point(&fragments));
 
     int
   };
 
-  let mut unhandled = all_intervals;
+  let mut state = State::new(intervals, reg_universe);
 
-  let mut state = State::new(reg_universe);
-
-  for interval in unhandled.iter_mut() {
-    debug!("handling {:?}", interval);
-    let start_point = interval.start_point(&fragments);
+  while let Some(interval_id) = state.next_unhandled() {
+    let start_point = state.intervals[interval_id].start_point(&fragments);
 
     state = update_state(start_point, state, &fragments);
 
-    let free_regs = state.regs(interval.reg_class());
+    let interval = &state.intervals[interval_id];
+    debug!("handling {:?}", interval);
+    let free_regs = &mut state.regs[interval.reg_class() as usize];
 
     let has_fixed_conflict = if let Some(fixed_reg) = interval.fixed_reg() {
       free_regs.is_taken(&fixed_reg)
@@ -351,13 +430,20 @@ pub fn alloc_main(
       spill();
     } else {
       if let Some(fixed_reg) = interval.fixed_reg() {
-        // Mark fixed register as active.
+        // Mark fixed register as taken.
         free_regs.take(&fixed_reg);
       } else {
         // Pick any register and assign it.
         let reg = free_regs.take_any();
+        insert_active(
+          &mut state.active,
+          &state.intervals,
+          interval,
+          &fragments,
+        );
+
+        let interval = &mut state.intervals[interval_id];
         interval.set_reg(reg);
-        state.insert_active(interval, &fragments);
       }
     }
   }
